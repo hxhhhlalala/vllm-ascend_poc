@@ -10,6 +10,9 @@
 
 # A6 uses CANN 9.3 SparseFlashAttention. Its schema and host registrations
 # must come from the SDK, including when building --ops=ALL.
+# The in-tree arch35 kernel only implements rope_head_dim=64, so A6 NoPE
+# (GLM-5.3-Flash C16) is served by the delivered SparseFlashMla path instead;
+# see SparseMLAMetadataState.use_smla in vllm_ascend/attention/sfa_v1.py.
 if("ascend960dt" IN_LIST ASCEND_COMPUTE_UNIT OR "ascend960pr" IN_LIST ASCEND_COMPUTE_UNIT)
     set(SFA_NON_A6_UNITS ${ASCEND_COMPUTE_UNIT})
     list(REMOVE_ITEM SFA_NON_A6_UNITS ascend960dt ascend960pr)

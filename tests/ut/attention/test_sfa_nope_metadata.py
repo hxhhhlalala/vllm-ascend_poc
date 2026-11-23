@@ -658,3 +658,28 @@ def test_sparse_mla_rejects_missing_sinks():
             _smla_metadata_stub(None),
             0.5,
         )
+
+
+def test_a6_uses_delivered_smla_path(monkeypatch):
+    """A6 serves NoPE through the same delivered SparseFlashMla contract as A5."""
+    monkeypatch.setattr(
+        sparse_mla,
+        "get_current_hardware_profile",
+        lambda: SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.A6),
+    )
+    monkeypatch.setattr(
+        sparse_mla,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_sparse_sfa_c8=False, enable_sparse_sfa_turboquant=False),
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=128),
+        model_config=SimpleNamespace(max_model_len=4096),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1, tensor_parallel_size=1),
+    )
+    state = sparse_mla.SparseMLAMetadataState(
+        SimpleNamespace(block_size=128), config, torch.device("cpu"), num_heads=4
+    )
+    assert state.use_smla is True

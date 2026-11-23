@@ -178,6 +178,32 @@ def _reference_sparse_attention(**kwargs):
     return latent_output, unused, unused
 
 
+def test_sparse_mla_zeroes_tnd_capacity_tail() -> None:
+    """C16 (BF16) NoPE SFA must clear rows padded beyond the batch length."""
+    rows, heads, dim, valid_rows = 4, 2, 8, 3
+    metadata = SimpleNamespace(
+        block_size=4,
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, valid_rows], dtype=torch.int32),
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        smla_metadata=None,
+    )
+    query = torch.zeros(rows, heads, dim)
+    cache = torch.zeros(1, 4, 1, dim)
+    indices = torch.zeros(rows, 1, 2, dtype=torch.int32)
+    # Model an operator that writes only valid rows and leaves the tail stale.
+    kernel_output = torch.full((rows, heads, dim), 9.0)
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_sparse_flash_attention",
+        create=True,
+        return_value=(kernel_output, torch.empty(0), torch.empty(0)),
+    ):
+        output = sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5)
+    assert torch.equal(output[:valid_rows], kernel_output[:valid_rows])
+    assert torch.count_nonzero(output[valid_rows:]) == 0
+
+
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("empty_rope_handle", [False, True])
 @pytest.mark.parametrize("enable_c8", [False, True])
@@ -514,3 +540,11 @@ def test_nope_pcp_forward_preserves_collective_rows_on_empty_and_uneven_ranks(
     assert impl.indexer.call_args.kwargs["compute_topk"] == (actual_tokens > 0)
     assert impl._execute_sparse_flash_attention_process.call_count == int(actual_tokens > 0)
     torch.testing.assert_close(output, torch.full_like(output, float(actual_tokens > 0)))
+
+
+def test_zero_tnd_capacity_tail_keeps_device_length_rows() -> None:
+    output = torch.full((4, 2, 3), 7.0)
+    lengths = torch.tensor([1, 3], dtype=torch.int32)
+    masked = sparse_mla._zero_tnd_capacity_tail(output, lengths)
+    assert torch.equal(masked[:3], output[:3])
+    assert torch.count_nonzero(masked[3:]) == 0

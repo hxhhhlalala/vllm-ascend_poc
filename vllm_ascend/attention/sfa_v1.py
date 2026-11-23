@@ -168,6 +168,16 @@ def _view_cache_as_operator_pages(cache: torch.Tensor, block_size: int) -> torch
         raise ValueError("Sparse MLA oversized storage pages must support a zero-copy operator-page view.") from err
 
 
+def _zero_tnd_capacity_tail(output, cumulative_query_lengths):
+    """Zero TND rows padded past the last cumulative query length.
+
+    Read the length from the device tensor so a replayed graph clears the tail
+    of the current batch instead of freezing a host-side token count.
+    """
+    valid_rows = torch.arange(output.shape[0], device=output.device) < cumulative_query_lengths[-1]
+    return output.masked_fill(~valid_rows[:, None, None], 0)
+
+
 def sparse_mla(query, cache, indices, metadata, scale):
     """Attend to original latent KV, using the platform's NoPE operator."""
     cache = _view_cache_as_operator_pages(cache, metadata.block_size)
@@ -223,7 +233,16 @@ def sparse_mla(query, cache, indices, metadata, scale):
             topk_value_mode=1,
             return_softmax_lse=False,
         )
+        if get_current_hardware_profile().device_adaptor_family is DeviceAdaptorFamily.A6:
+            # A6 reuses the A5 delivered SparseFlashMla contract. Keep the TND
+            # capacity tail defined for graph replay until that op is confirmed
+            # to clear it on A6 as well.
+            result = (
+                _zero_tnd_capacity_tail(result[0], cu_seqlens_q[1:].to(torch.int32)),
+                *result[1:],
+            )
     else:
+        actual_seq_lengths_query = metadata.query_start_loc[1:].to(torch.int32)
         result = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=query.contiguous(),
             key=cache,
@@ -232,7 +251,7 @@ def sparse_mla(query, cache, indices, metadata, scale):
             scale_value=scale,
             sparse_block_size=1,
             block_table=metadata.block_table,
-            actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
+            actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
             query_rope=None,
             key_rope=None,
@@ -242,6 +261,11 @@ def sparse_mla(query, cache, indices, metadata, scale):
             attention_mode=2,
             return_softmax_lse=False,
         )
+        # TND graphs pad the query bucket to a captured size while the operator
+        # writes only the rows below the last cumulative query length. Zero the
+        # capacity tail from the device-side lengths, not a host token count, so
+        # a replayed graph clears whichever tail the current batch has.
+        result = (_zero_tnd_capacity_tail(result[0], actual_seq_lengths_query), *result[1:])
     return result[0]
 
 
@@ -257,7 +281,13 @@ class SparseMLAMetadataState:
         if block_size <= 0 or block_size % kernel_block_size:
             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
         self.split = block_size // kernel_block_size
-        self.use_smla = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        # A6 reuses A5's delivered SparseFlashMla path for NoPE: the in-tree
+        # arch35 SFA kernel only implements rope_head_dim=64, while GLM-5.3-Flash
+        # C16 reaches this helper with rope_head_dim=0.
+        self.use_smla = get_current_hardware_profile().device_adaptor_family in (
+            DeviceAdaptorFamily.FP8_OPTIMIZED,
+            DeviceAdaptorFamily.A6,
+        )
         if self.use_smla:
             config = get_ascend_config()
             self.use_smla = not (config.enable_sparse_sfa_c8 or config.enable_sparse_sfa_turboquant)
