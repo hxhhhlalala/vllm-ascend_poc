@@ -66,7 +66,7 @@ public:
     /* =================编译期常量的基本块信息================= */
     static constexpr uint32_t s1BaseSize = 64;
     static constexpr uint32_t s2BaseSize = 128;
-    static constexpr uint32_t dBaseSize = 576;
+    static constexpr uint32_t dBaseSize = NO_ROPE ? 512 : 576;
     static constexpr uint32_t dBaseMatmulSize = 128;
 
     __aicore__ inline SFAMatmulService() {};
@@ -137,7 +137,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>:
     if ASCEND_IS_AIC {
         tPipe = pipe;
         this->queryGm.gmTensor.SetGlobalBuffer((__gm__ Q_T *)query);
-        this->queryRopeGm.gmTensor.SetGlobalBuffer((__gm__ Q_T *)queryRope);
+        if constexpr (!NO_ROPE) {
+            this->queryRopeGm.gmTensor.SetGlobalBuffer((__gm__ Q_T *)queryRope);
+        }
         InitLocalBuffer(l1BuffMgr);
     }
 }
@@ -182,15 +184,19 @@ SFAMatmulService<TEMPLATE_ARGS>::InitGmTensor(__gm__ uint8_t *actualSeqLengthsQ,
     if constexpr (LAYOUT_T == SFA_LAYOUT::BSND) {
         this->queryGm.offsetCalculator.Init(constInfo.bSize, constInfo.n2Size, constInfo.gSize,
             constInfo.s1Size, constInfo.dSize);
-        this->queryRopeGm.offsetCalculator.Init(constInfo.bSize, constInfo.n2Size, constInfo.gSize,
-            constInfo.s1Size, constInfo.dSizeRope);
+        if constexpr (!NO_ROPE) {
+            this->queryRopeGm.offsetCalculator.Init(constInfo.bSize, constInfo.n2Size, constInfo.gSize,
+                constInfo.s1Size, constInfo.dSizeRope);
+        }
     } else {  // SFA_LAYOUT::TND
         GlobalTensor<int32_t> actualSeqQLen;
         actualSeqQLen.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengthsQ);
         this->queryGm.offsetCalculator.Init(constInfo.n2Size, constInfo.gSize, constInfo.dSize,
             actualSeqQLen, constInfo.actualSeqLenSize);
-        this->queryRopeGm.offsetCalculator.Init(constInfo.n2Size, constInfo.gSize, constInfo.dSizeRope,
-            actualSeqQLen, constInfo.actualSeqLenSize);
+        if constexpr (!NO_ROPE) {
+            this->queryRopeGm.offsetCalculator.Init(constInfo.n2Size, constInfo.gSize, constInfo.dSizeRope,
+                actualSeqQLen, constInfo.actualSeqLenSize);
+        }
     }
 }
 
@@ -228,13 +234,15 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>:
         uint32_t s1Coord = runInfo.s1oIdx * runInfo.qSNumInOneBlock;
         uint64_t queryGmOffset = this->queryGm.offsetCalculator.GetOffset(runInfo.boIdx, runInfo.n2oIdx,
             runInfo.goIdx, s1Coord, 0);
-        uint64_t queryRopeGmOffset = this->queryRopeGm.offsetCalculator.GetOffset(runInfo.boIdx, runInfo.n2oIdx,
-            runInfo.goIdx, s1Coord, 0);
         CopyToL1Nd2Nz<Q_T>(inputLeftTensor, this->queryGm.gmTensor[queryGmOffset],
             runInfo.mRealSize, 512, 512); // 64 constInfo.dSize constInfo.mm1Ka
-        CopyToL1Nd2Nz<Q_T>(inputLeftTensor[Align16Func(runInfo.mRealSize) * 512],
-            this->queryRopeGm.gmTensor[queryRopeGmOffset], runInfo.mRealSize,
-            64, 64); // constInfo.dSize constInfo.mm1Ka
+        if constexpr (!NO_ROPE) {
+            uint64_t queryRopeGmOffset = this->queryRopeGm.offsetCalculator.GetOffset(runInfo.boIdx, runInfo.n2oIdx,
+                runInfo.goIdx, s1Coord, 0);
+            CopyToL1Nd2Nz<Q_T>(inputLeftTensor[Align16Func(runInfo.mRealSize) * 512],
+                this->queryRopeGm.gmTensor[queryRopeGmOffset], runInfo.mRealSize,
+                64, 64); // constInfo.dSize constInfo.mm1Ka
+        }
         inputLeftBuf.Set<HardEvent::MTE2_MTE1>(); // 通知
     } else { // 非S2的第一次循环直接复用Q
         inputLeftBuf = l1QBuffers.GetPre();
@@ -248,7 +256,8 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>:
     LocalTensor<Q_T> dst = inputRightBuf.GetTensor<Q_T>();
     v0ResGm.WaitCrossCore();
     GlobalTensor<Q_T> v0ResGmTensor = v0ResGm.template GetTensor<Q_T>();
-    CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, 576, 576);
+    constexpr uint32_t kvTileDim = NO_ROPE ? 512 : 576;
+    CopyToL1Nd2Nz<Q_T>(dst, v0ResGmTensor, runInfo.s2RealSize, kvTileDim, kvTileDim);
     SetFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
     WaitFlag<HardEvent::MTE2_MTE1>(mte1ToMte2Id[runInfo.taskIdMod3]);
 

@@ -224,6 +224,7 @@ def sparse_mla(query, cache, indices, metadata, scale):
             return_softmax_lse=False,
         )
     else:
+        actual_seq_lengths_query = metadata.query_start_loc[1:].to(torch.int32)
         result = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=query.contiguous(),
             key=cache,
@@ -232,7 +233,7 @@ def sparse_mla(query, cache, indices, metadata, scale):
             scale_value=scale,
             sparse_block_size=1,
             block_table=metadata.block_table,
-            actual_seq_lengths_query=metadata.query_start_loc[1:].to(torch.int32),
+            actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
             query_rope=None,
             key_rope=None,
@@ -242,6 +243,12 @@ def sparse_mla(query, cache, indices, metadata, scale):
             attention_mode=2,
             return_softmax_lse=False,
         )
+        # TND graphs pad the query bucket to a captured size while the operator
+        # writes only the rows below the last cumulative query length. Zero the
+        # capacity tail from the device-side lengths, not a host token count, so
+        # a replayed graph clears whichever tail the current batch has.
+        valid_rows = torch.arange(result[0].shape[0], device=result[0].device) < actual_seq_lengths_query[-1]
+        result = (result[0].masked_fill(~valid_rows[:, None, None], 0), *result[1:])
     return result[0]
 
 

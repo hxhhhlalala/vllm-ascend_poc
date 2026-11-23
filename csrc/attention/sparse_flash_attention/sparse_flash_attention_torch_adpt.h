@@ -121,8 +121,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
-    // A6 builds omit the legacy SFA custom OPP, so this existing ACLNN
-    // entry resolves to CANN 9.3 without vendoring its kernel or tiling.
+    // The ACLNN symbol resolves to this repo's custom OPP when it is built
+    // (A5 and, with the NO_ROPE arch35 variant, A6); otherwise it falls back
+    // to the CANN SDK kernel through the shared op_api lookup order.
     EXEC_NPU_CMD(
         aclnnSparseFlashAttention,
         query,

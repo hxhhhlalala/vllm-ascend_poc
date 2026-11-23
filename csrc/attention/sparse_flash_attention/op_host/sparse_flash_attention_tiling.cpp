@@ -465,9 +465,10 @@ void SFAMlaTiling::GetWorkspaceSize()
         workspaceSize_ += preLoadNum * mBaseSize_ * actCoreNum * nUpdateElemSize;
         workspaceSize_ += preLoadNum * mBaseSize_ * actCoreNum * softmaxSumElemSize;
         // topk BlkSize == 1场景, 需要额外空间缓存离散聚合的值
-        // kvMergeGm_ is sized for the maximal rope=64 form so its stride
-        // matches the kernel-side 512*576 layout. With rope=0 the rope segment
-        // stays unused; the stride is unchanged so host and kernel agree.
+        // Budget the maximal rope=64 form. The kernel keeps the 576-wide
+        // region even for NoPE (the probability tile reuses the rope columns),
+        // but packs only the 512-wide V rows inside it, so this capacity is
+        // sufficient for both variants.
         //              bufNum  s2Base   D   dRope  sizeOf(half)
         // 4:bufNum  512:s2Base  512:D  64:dRope  2:sizeOf(half)
         workspaceSize_ += 4 * 512 * (512 + 64) * 2 * actCoreNum;

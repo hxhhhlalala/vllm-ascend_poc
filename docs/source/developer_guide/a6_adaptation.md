@@ -92,7 +92,7 @@ need cleanup before an upstream submission.
 | --- | --- | --- |
 | GMM-SiTU | Host build excludes non-950 targets and the compute body is guarded by 3510. Internal control uses two AIV roles | Implement the A6 controller, work partition and synchronization |
 | QLI v2 | Added FP8 keys lack a complete A6 FP8 execution branch | Port the arch92 compute path with its metadata ABI |
-| Sparse and quantized sparse flash attention | Target registration coexists with older arch22 and 1:2 execution paths | Port target-specific tiling, execution and cross-core flags |
+| Sparse and quantized sparse flash attention | GLM-5.3-Flash C16 is NoPE (`mla_use_nope=true`, `qk_rope_head_dim=0`) and reaches `sparse_mla()` with `query_rope`/`key_rope` unset. The arch35 SFA kernel now carries a `NO_ROPE` variant selected at runtime from `baseParams.ropeHeadDim`: K and the packed KV tile are 512 wide, the rope copies are compiled out, and the TND capacity tail is cleared in `CleanOutput`. A6 builds the in-tree OPP again. C8 keeps using the arch35 QSFA kernel with its own in-kernel tail clear. | Compile on the target CANN, then check numeric parity against the SDK kernel and graph replay on GLM-5.3-Flash C16 and a rope=64 MLA model. The A6 workspace branch and core budget are still shared with A2/A3. |
 | QLI metadata | Fixed core counts affect allocation and offsets | Use runtime core budgets with a version-matched producer/consumer layout |
 | GDN FwdH/FwdO | Architecture tags and entry ratio cover part of the migration | Audit head slots, workspace, vector scheduling and flag ownership |
 | HcPre | Host and kernel dispatch still select legacy behavior for A6 | Port the complete arch92 pre/sinkhorn path behind the community ABI |

@@ -25,12 +25,12 @@ using namespace AscendC;
 
 #if (__CCE_AICORE__ == 310)
 #if defined(__DAV_C310_CUBE__)
-#define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
+#define SFA_OP_IMPL(templateClass, tilingdataClass, NO_ROPE, ...)                                 \
     do {                                                                                          \
         using CubeBlockType = typename std::conditional<g_coreType == AscendC::AIC,               \
-            BaseApi::SFAMatmulService<__VA_ARGS__>, BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type; \
+            BaseApi::SFAMatmulService<__VA_ARGS__, NO_ROPE>, BaseApi::SFAMatmulServiceDummy<__VA_ARGS__, NO_ROPE>>::type; \
         using VecBlockType = typename std::conditional<g_coreType == AscendC::AIC,                \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>, BaseApi::SFAVectorService<__VA_ARGS__>>::type;   \
+            BaseApi::SFAVectorServiceDummy<__VA_ARGS__, NO_ROPE>, BaseApi::SFAVectorService<__VA_ARGS__, NO_ROPE>>::type;   \
         templateClass<CubeBlockType, VecBlockType> op;                                            \
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                       \
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,      \
@@ -38,12 +38,12 @@ using namespace AscendC;
         op.Process();                                                                             \
     } while (0)
 #else
-#define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
+#define SFA_OP_IMPL(templateClass, tilingdataClass, NO_ROPE, ...)                                 \
     do {                                                                                          \
         using CubeBlockType = typename std::conditional<g_coreType == AscendC::AIC,               \
-            BaseApi::SFAMatmulService<__VA_ARGS__>, BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type; \
+            BaseApi::SFAMatmulService<__VA_ARGS__, NO_ROPE>, BaseApi::SFAMatmulServiceDummy<__VA_ARGS__, NO_ROPE>>::type; \
         using VecBlockType = typename std::conditional<g_coreType == AscendC::AIC,                \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>, BaseApi::SFAVectorService<__VA_ARGS__>>::type;   \
+            BaseApi::SFAVectorServiceDummy<__VA_ARGS__, NO_ROPE>, BaseApi::SFAVectorService<__VA_ARGS__, NO_ROPE>>::type;   \
         templateClass<CubeBlockType, VecBlockType> op;                                            \
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                       \
         const tilingdataClass *__restrict tilingData = &tiling_data_in;                                     \
@@ -53,7 +53,8 @@ using namespace AscendC;
     } while (0)
 #endif
 #else
-#define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
+// A2/A3 kernel has no NoPE variant; the token keeps the call sites identical.
+#define SFA_OP_IMPL(templateClass, tilingdataClass, NO_ROPE, ...)                                 \
     do {                                                                                          \
         templateClass<SFAType<__VA_ARGS__>> op;                                                   \
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                     \
@@ -79,24 +80,41 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
     __gm__ uint8_t *user = GetUserWorkspace(workspace);
 
 #if (__CCE_AICORE__ == 310)
-    if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_BF16 &&
-                  ORIG_DTYPE_ATTENTION_OUT == DT_BF16) {
-        SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, bfloat16_t, bfloat16_t,
-            float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
-            static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+    // NoPE (rope_head_dim=0) keeps a 512-wide K dimension; RoPE keeps 576.
+    // Select at runtime from the tiling so a single tiling key still serves both.
+    GET_TILING_DATA_WITH_STRUCT(SparseFlashAttentionTilingDataMla, dispatchTiling, tiling);
+    if (dispatchTiling.baseParams.ropeHeadDim == 0) {
+        if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_BF16 &&
+                      ORIG_DTYPE_ATTENTION_OUT == DT_BF16) {
+            SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, true, bfloat16_t,
+                bfloat16_t, float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
+                static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+        } else {
+            SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, true, half, half,
+                float, half, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
+                static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+        }
     } else {
-        SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, half, half,
-            float, half, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
-            static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+        if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_BF16 &&
+                      ORIG_DTYPE_ATTENTION_OUT == DT_BF16) {
+            SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, false, bfloat16_t,
+                bfloat16_t, float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
+                static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+        } else {
+            SFA_OP_IMPL(BaseApi::SparseFlashAttentionKernelMla, SparseFlashAttentionTilingDataMla, false, half, half,
+                float, half, FLASH_DECODE, PAGE_ATTENTION, static_cast<SFA_LAYOUT>(LAYOUT_T),
+                static_cast<SFA_LAYOUT>(KV_LAYOUT_T), static_cast<SFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
+        }
     }
 #else
     if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT16 &&
                   ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
-        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, half, half, half,
+        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, false, half, half, half,
             FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
     } else { // bf16
-        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, bfloat16_t, bfloat16_t, bfloat16_t,
-            FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T), TEMPLATE_MODE);
+        SFA_OP_IMPL(SparseFlashAttentionMla, SparseFlashAttentionTilingDataMla, false, bfloat16_t, bfloat16_t,
+            bfloat16_t, FLASH_DECODE, static_cast<SFA_LAYOUT>(LAYOUT_T), static_cast<SFA_LAYOUT>(KV_LAYOUT_T),
+            TEMPLATE_MODE);
     }
 #endif
 }

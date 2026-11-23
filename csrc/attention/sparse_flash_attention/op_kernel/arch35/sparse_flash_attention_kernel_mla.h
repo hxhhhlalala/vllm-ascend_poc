@@ -348,7 +348,9 @@ SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::InitMMResBuf(__gm__ 
     uint32_t mm1ResultSize = constInfo.s1BaseSize / CV_RATIO * constInfo.s2BaseSize * sizeof(T);
     uint32_t mm2ResultSize = constInfo.s1BaseSize / CV_RATIO * 512 * sizeof(T);
     uint32_t mm2LeftSize = constInfo.s1BaseSize * constInfo.s2BaseSize * sizeof(Q_T);
-    uint32_t mm1RightSize = constInfo.s2BaseSize * 576 * sizeof(Q_T);
+    // Capacity stays 576 wide even for NoPE: ProcessVec1 writes the probability
+    // tile into the rope columns after the 512-wide V block.
+    uint32_t mm1RightSize = constInfo.s2BaseSize * 576U * sizeof(Q_T);
     l1BufferManager.Init(pipe, 524288); // 512 * 1024
     // 保存p结果的L1内存必须放在第一个L1 policy上，保证和vec申请的地址相同
     l1RightBuffers.Init(l1BufferManager, mm1RightSize);
@@ -380,6 +382,8 @@ SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::InitMMResBuf(__gm__ 
         bmm1Buffers.Get().SetCrossCore();
     }
 
+    // Keep the 576-wide stride so the GM triple buffer matches the host tiling
+    // workspace formula; NoPE packs only the first 512 columns of each row.
     uint32_t v0ResSize = constInfo.s2BaseSize * 576U * sizeof(Q_T);
     int64_t totalOffset;
     if constexpr (IS_SPLIT_G) {
@@ -420,7 +424,7 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
     constInfo.s2Size = sharedParams.s2Size;
     constInfo.dSize = sharedParams.dSize;
     constInfo.dSizeVInput = sharedParams.dSizeVInput;
-    constInfo.dSizeRope = 64;
+    constInfo.dSizeRope = NO_ROPE ? 0 : 64;
     constInfo.dSizeNope = 512;
     constInfo.tileSize = sharedParams.tileSize;
     constInfo.sparseBlockCount = sharedParams.sparseBlockCount;

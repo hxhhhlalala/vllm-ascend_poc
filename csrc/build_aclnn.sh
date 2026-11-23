@@ -222,11 +222,13 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     SOC_ARG="ascend950"
 elif [[ "$SOC_VERSION" =~ ^ascend960 ]]; then
     log "matched SOC branch: ascend960"
-    # A6 uses SDK SparseFlashAttention; avoid a competing registration.
+    # A6 builds the in-tree SFA kernel; its arch35 NO_ROPE variant serves
+    # GLM-5.3-Flash C16 (rope_head_dim=0) without the CANN SDK operator.
     # dependency: catlass
     setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
+        "sparse_flash_attention"
         "recurrent_gated_delta_rule_v310"
         "chunk_gated_delta_rule_fwd_h_vllm"
         "scatter_nd_update_sk"

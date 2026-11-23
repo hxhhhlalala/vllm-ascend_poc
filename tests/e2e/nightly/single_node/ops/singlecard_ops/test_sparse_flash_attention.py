@@ -115,3 +115,53 @@ def test_sparse_flash_attention_tnd_output_padding():
     graph.replay()
     torch.testing.assert_close(output[:valid_rows], reference, rtol=0, atol=0)
     assert torch.count_nonzero(output[valid_rows:]) == 0
+
+
+@pytest.mark.skipif(get_ascend_device_type() != AscendDeviceType.A6, reason="NoPE SFA regression for A6")
+def test_sparse_flash_attention_nope_tnd_output_padding():
+    """GLM-5.3-Flash C16 shape: rope_head_dim=0, BF16 KV, TND query."""
+    enable_custom_op()
+    torch.manual_seed(53)
+    heads, block_size, valid_rows = 8, 128, 40
+    padding = 8
+    dtype = torch.bfloat16
+    scale = 1 / 24
+    pages = torch.randn(1, block_size, 1, 512, dtype=dtype, device="npu")
+    flat_kv = pages.reshape(block_size, 512)
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device="npu")
+    indices = torch.full((valid_rows + padding, 1, block_size), -1, dtype=torch.int32, device="npu")
+    indices[:valid_rows, 0, :] = torch.arange(block_size, dtype=torch.int32, device="npu")
+    query = torch.randn(valid_rows + padding, heads, 512, dtype=dtype, device="npu")
+
+    def attention(rows):
+        output, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=query[:rows],
+            key=pages,
+            value=pages,
+            sparse_indices=indices[:rows],
+            scale_value=scale,
+            sparse_block_size=1,
+            block_table=block_table,
+            actual_seq_lengths_query=torch.tensor([valid_rows], dtype=torch.int32, device="npu"),
+            actual_seq_lengths_kv=torch.tensor([block_size], dtype=torch.int32, device="npu"),
+            query_rope=None,
+            key_rope=None,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            # mask mode 0 matches the dense reference; the NoPE kernel path is
+            # independent of the mask, and needInit stays 0 so the TND tail is
+            # cleared by ClearOutputTail rather than the full init.
+            sparse_mode=0,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
+        return output
+
+    reference = attention(valid_rows)
+    logits = torch.einsum("thd,kd->thk", query[:valid_rows].float(), flat_kv.float()) * scale
+    expected = torch.einsum("thk,kd->thd", logits.softmax(-1), flat_kv.float()).to(dtype)
+    torch.testing.assert_close(reference, expected, atol=0.05, rtol=0.02)
+
+    padded = attention(valid_rows + padding)
+    torch.testing.assert_close(padded[:valid_rows], reference, rtol=0, atol=0)
+    assert torch.count_nonzero(padded[valid_rows:]) == 0

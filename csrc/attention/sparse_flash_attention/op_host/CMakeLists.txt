@@ -8,14 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # Dependencies may add op_host directly, bypassing the operator CMakeLists.
-if("ascend960dt" IN_LIST ASCEND_COMPUTE_UNIT OR "ascend960pr" IN_LIST ASCEND_COMPUTE_UNIT)
-    set(SFA_NON_A6_UNITS ${ASCEND_COMPUTE_UNIT})
-    list(REMOVE_ITEM SFA_NON_A6_UNITS ascend960dt ascend960pr)
-    if(SFA_NON_A6_UNITS)
-        message(FATAL_ERROR "Build A6 and other SoCs in separate custom-OPP packages.")
-    endif()
-    return()
-endif()
+# A6 registers the in-tree SFA host implementation; the arch35 kernel selects
+# its NO_ROPE variant from the tiling, so NoPE (GLM-5.3-Flash C16) is served.
 
 add_op_to_compiled_list()
 

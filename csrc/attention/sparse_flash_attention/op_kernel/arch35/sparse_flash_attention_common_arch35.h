@@ -85,7 +85,8 @@ __aicore__ constexpr uint64_t Align64Func(uint64_t data)
     X(LAYOUT_T, SFA_LAYOUT, SFA_LAYOUT::BSND) \
     X(KV_LAYOUT_T, SFA_LAYOUT, SFA_LAYOUT::PA_BSND) \
     X(TEMPLATE_MODE, SFATemplateMode, SFATemplateMode::SCFA_TEMPLATE_MODE) \
-    X(IS_SPLIT_G, bool, false)
+    X(IS_SPLIT_G, bool, false) \
+    X(NO_ROPE, bool, false)
 
 
 /* 1. 生成带默认值的模版Template */

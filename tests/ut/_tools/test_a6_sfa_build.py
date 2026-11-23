@@ -37,14 +37,16 @@ class TestA6SFABuild(unittest.TestCase):
             )
             return subprocess.run([cmake, "-P", str(path)], capture_output=True, text=True, timeout=30)
 
-    def test_a6_skips_host_registration_at_both_entries(self):
+    def test_a6_registers_host_implementation(self):
+        # A6 now builds the in-tree SFA kernel: the arch35 kernel picks its
+        # NO_ROPE variant from tiling, so NoPE (GLM-5.3-Flash C16) is served.
         for units in ["ascend960dt", "ascend960pr", "ascend960dt;ascend960pr"]:
             for entry in ["CMakeLists.txt", "op_host/CMakeLists.txt"]:
                 with self.subTest(units=units, entry=entry):
                     result = self.run_entry(units, entry)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertNotIn("SELECTED:", result.stdout)
-                    self.assertNotIn("REGISTERED:", result.stdout)
+                    expected = "SELECTED:op_host" if entry == "CMakeLists.txt" else "REGISTERED:SFA"
+                    self.assertIn(expected, result.stdout)
 
     def test_other_socs_keep_host_registration(self):
         for units in ["ascend950", "ascend910b", "ascend910_93"]:
@@ -55,12 +57,13 @@ class TestA6SFABuild(unittest.TestCase):
                     expected = "SELECTED:op_host" if entry == "CMakeLists.txt" else "REGISTERED:SFA"
                     self.assertIn(expected, result.stdout)
 
-    def test_mixed_soc_packages_require_separate_builds(self):
+    def test_mixed_soc_packages_are_allowed(self):
+        # A5 and A6 share the arch35 directory, so a mixed package can compile
+        # the same operator sources for both SoCs.
         for entry in ["CMakeLists.txt", "op_host/CMakeLists.txt"]:
             with self.subTest(entry=entry):
                 result = self.run_entry("ascend950;ascend960dt", entry)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("separate custom-OPP packages", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

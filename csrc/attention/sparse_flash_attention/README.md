@@ -13,6 +13,11 @@
 
 ## Ascend 960DT 的 CANN 9.3 算子补丁
 
+> 当前仓库的 A6 构建会把本目录的 in-tree 算子编入自定义包，arch35 kernel 按
+> tiling 的 `ropeHeadDim` 在运行时选择 `NO_ROPE`（512 宽）或 RoPE（576 宽）
+> 变体，并在 `CleanOutput` 中清零 TND 尾部。只有在未安装自定义包、回落到
+> CANN SDK 算子时才需要下面的补丁流程。
+
 Ascend 960DT 调用 CANN 的 `aclnnSparseFlashAttention`。在 `TND` 布局下，最后一个累计 Q 长度之后的行用于补齐。`cann-9.3-tnd-padding.patch` 使 A6 的向量核只对这段 attention 输出写零，保留原有的全量初始化条件。
 
 在与已安装 CANN 算子匹配的 ops-transformer 源码目录，设置 `VLLM_ASCEND_SRC` 为本仓库的绝对路径，然后构建独立算子包。补丁以 `75b6beb460eb32644a6c87fa5f9d76b756d17b4d` 为基线。
