@@ -129,36 +129,58 @@ __aicore__ inline void ComputeS1LoopInfo(RunParamStr& runParam, const ConstInfo 
 
 TEMPLATE_INTF
 __aicore__ inline void ComputeSouterParam(RunParamStr& runParam, const ConstInfo &constInfo,
-    uint32_t sOuterLoopIdx)
+    uint32_t sOuterLoopIdx, int32_t mHalf)
 {
     int64_t cubeSOuterOffset = sOuterLoopIdx * runParam.qSNumInOneBlock;
     if (runParam.actualS1Size == 0) {
         runParam.s1RealSize = 0;
         runParam.mRealSize = 0;
+        runParam.halfMRealSize = 0;
+        runParam.firstHalfMRealSize = 0;
+        runParam.fullMRealSize = 0;
     } else {
         runParam.s1RealSize = Min(runParam.qSNumInOneBlock, runParam.actualS1Size - cubeSOuterOffset);
-        runParam.mRealSize = runParam.s1RealSize * constInfo.gSize;
+        uint32_t fullMRealSize = runParam.s1RealSize * constInfo.gSize;
         if constexpr (IS_SPLIT_G) {
-            runParam.mRealSize = runParam.mRealSize >> 1;
+            fullMRealSize = fullMRealSize >> 1;
+        }
+        runParam.fullMRealSize = fullMRealSize;
+        if constexpr (AIV_PER_AIC == 1) {
+            // One AIV owns the whole AIC. Cut the M block into mPasses slices,
+            // each within the 1:2-sized pipeline row budget.
+            const uint32_t passes = constInfo.mPasses > 0 ? constInfo.mPasses : 1U;
+            const uint32_t passRows = (fullMRealSize + passes - 1U) / passes;
+            const uint32_t passStart = static_cast<uint32_t>(mHalf) * passRows;
+            runParam.mRealSize = (passStart >= fullMRealSize) ? 0U : Min(passRows, fullMRealSize - passStart);
+            runParam.halfMRealSize = runParam.mRealSize;
+            runParam.firstHalfMRealSize = passStart;
+        } else {
+            runParam.mRealSize = fullMRealSize;
+            runParam.halfMRealSize = (runParam.mRealSize + 1) >> 1;
+            runParam.firstHalfMRealSize = runParam.halfMRealSize;
         }
     }
 
     runParam.cubeMOuterOffset = cubeSOuterOffset * constInfo.gSize;
-    runParam.halfMRealSize = (runParam.mRealSize + 1) >> 1;
-    runParam.firstHalfMRealSize = runParam.halfMRealSize;
-    if (constInfo.subBlockIdx == 1) {
-        runParam.halfMRealSize = runParam.mRealSize - runParam.halfMRealSize;
-        runParam.mOuterOffset = runParam.cubeMOuterOffset + runParam.firstHalfMRealSize;
+    if constexpr (AIV_PER_AIC == 2) {
+        if (constInfo.subBlockIdx == 1) {
+            runParam.halfMRealSize = runParam.mRealSize - runParam.halfMRealSize;
+            runParam.mOuterOffset = runParam.cubeMOuterOffset + runParam.firstHalfMRealSize;
+        } else {
+            runParam.mOuterOffset = runParam.cubeMOuterOffset;
+        }
+        runParam.halfS1RealSize = (runParam.s1RealSize + 1) >> 1;
+        runParam.firstHalfS1RealSize = runParam.halfS1RealSize;
+        if (constInfo.subBlockIdx == 1) {
+            runParam.halfS1RealSize = runParam.s1RealSize - runParam.halfS1RealSize;
+            runParam.sOuterOffset = cubeSOuterOffset + runParam.halfMRealSize / constInfo.gSize;
+        } else {
+            runParam.sOuterOffset = cubeSOuterOffset;
+        }
     } else {
         runParam.mOuterOffset = runParam.cubeMOuterOffset;
-    }
-
-    runParam.halfS1RealSize = (runParam.s1RealSize + 1) >> 1;
-    runParam.firstHalfS1RealSize = runParam.halfS1RealSize;
-    if (constInfo.subBlockIdx == 1) {
-        runParam.halfS1RealSize = runParam.s1RealSize - runParam.halfS1RealSize;
-        runParam.sOuterOffset = cubeSOuterOffset + runParam.halfMRealSize / constInfo.gSize;
-    } else {
+        runParam.halfS1RealSize = runParam.s1RealSize;
+        runParam.firstHalfS1RealSize = 0;
         runParam.sOuterOffset = cubeSOuterOffset;
     }
     runParam.cubeSOuterOffset = cubeSOuterOffset;
@@ -196,13 +218,20 @@ __aicore__ inline void LoopSOuterOffsetInit(RunParamStr& runParam, const ConstIn
                     runParam.n2oIdx * constInfo.s1Size * constInfo.gSize +
                     runParam.sOuterOffset * constInfo.gSize;
             }
-            uint32_t aicIdx = constInfo.aivIdx >> 1U;
+            uint32_t aicIdx = (AIV_PER_AIC == 1) ? static_cast<uint32_t>(constInfo.aivIdx) :
+                (constInfo.aivIdx >> 1U);
             if (IS_SPLIT_G && aicIdx % 2U != 0) {
                 runParam.softmaxLseOffset += 64; // splitG时，需要偏移64
             }
-            if (constInfo.subBlockIdx == 1) {
-                runParam.softmaxLseOffset += runParam.firstHalfMRealSize;
+            // 1:2: only the second AIV writes the upper half of the group.
+            // 1:1: every pass writes firstHalfMRealSize-th head slice of the group.
+            if constexpr (AIV_PER_AIC == 2) {
+                if (constInfo.subBlockIdx == 1) {
+                    runParam.softmaxLseOffset += runParam.firstHalfMRealSize;
                 }
+            } else {
+                runParam.softmaxLseOffset += runParam.firstHalfMRealSize;
+            }
             }
     } else {
         if constexpr (LAYOUT_T == SFA_LAYOUT::TND) {
@@ -221,7 +250,7 @@ __aicore__ inline void LoopSOuterOffsetInit(RunParamStr& runParam, const ConstIn
 
 TEMPLATE_INTF
 __aicore__ inline bool ComputeParamS1(RunParamStr& runParam, const ConstInfo &constInfo,
-    uint32_t sOuterLoopIdx, __gm__ int32_t *cuSeqlensQAddr)
+    uint32_t sOuterLoopIdx, int32_t mHalf, __gm__ int32_t *cuSeqlensQAddr)
 {
     if (runParam.nextTokensPerBatch < 0) {
         if (runParam.s1oIdx < (runParam.nextTokensPerBatch * (-1)) \
@@ -230,7 +259,7 @@ __aicore__ inline bool ComputeParamS1(RunParamStr& runParam, const ConstInfo &co
         }
     }
 
-    ComputeSouterParam<TEMPLATE_INTF_ARGS>(runParam, constInfo, sOuterLoopIdx);
+    ComputeSouterParam<TEMPLATE_INTF_ARGS>(runParam, constInfo, sOuterLoopIdx, mHalf);
 
     LoopSOuterOffsetInit<TEMPLATE_INTF_ARGS>(runParam, constInfo, runParam.boIdx, cuSeqlensQAddr);
     return false;

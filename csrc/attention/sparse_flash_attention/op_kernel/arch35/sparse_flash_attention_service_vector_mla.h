@@ -373,27 +373,33 @@ TEMPLATES_DEF_NO_DEFAULT
 __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CalSparseCalSize(const RunInfo &runInfo, ConstInfo &constInfo)
 {
     if constexpr (IS_SPLIT_G) {
-        uint32_t aicIdx = constInfo.aivIdx >> 1U;
+        uint32_t coreIdx = (AIV_PER_AIC == 1) ? static_cast<uint32_t>(constInfo.aivIdx) :
+            (constInfo.aivIdx >> 1U);
         uint32_t v0S2SizeFirstCore = CeilDiv(runInfo.s2RealSize, 2);
         uint32_t v0S2SizeSecondCore = runInfo.s2RealSize - v0S2SizeFirstCore;
-        if (aicIdx % 2U == 0) {
-            if (GetSubBlockIdx() == 0) {
-                sparseCalSize = CeilDiv(v0S2SizeFirstCore, 2);
-                sparseS2Start = 0;
-            } else {
-                sparseCalSize = v0S2SizeFirstCore - CeilDiv(v0S2SizeFirstCore, 2);
-                sparseS2Start = CeilDiv(v0S2SizeFirstCore, 2);
-            }
+        if (coreIdx % 2U == 0) {
+            sparseS2Start = 0;
+            sparseCalSize = v0S2SizeFirstCore;
         } else {
+            sparseS2Start = v0S2SizeFirstCore;
+            sparseCalSize = v0S2SizeSecondCore;
+        }
+        if constexpr (AIV_PER_AIC == 2) {
+            // The two AIVs paired with one cube core split its s2 slice again.
+            const uint32_t firstHalf = CeilDiv(static_cast<uint32_t>(sparseCalSize), 2);
             if (GetSubBlockIdx() == 0) {
-                sparseCalSize = CeilDiv(v0S2SizeSecondCore, 2);
-                sparseS2Start = v0S2SizeFirstCore;
+                sparseCalSize = firstHalf;
             } else {
-                sparseCalSize = v0S2SizeSecondCore - CeilDiv(v0S2SizeSecondCore, 2);
-                sparseS2Start = v0S2SizeFirstCore + CeilDiv(v0S2SizeSecondCore, 2);
+                sparseS2Start += firstHalf;
+                sparseCalSize -= firstHalf;
             }
         }
         sparseS2End = sparseS2Start + sparseCalSize;
+    } else if constexpr (AIV_PER_AIC == 1) {
+        // A6: the single AIV moves every KV row of this task.
+        sparseS2Start = 0;
+        sparseS2End = runInfo.s2RealSize;
+        sparseCalSize = sparseS2End;
     } else {
         int64_t s2PerVecLoop = 2LL;
         int64_t vecNum = 2LL;
@@ -524,11 +530,17 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
 
     LocalTensor<Q_T> mm2AL1Tensor = outputBuf.GetTensor<Q_T>(s2BaseSize * constInfo.dSizeV);
     if (likely(runInfo.halfMRealSize != 0)) {
-        DataCopy(mm2AL1Tensor[constInfo.subBlockIdx * \
-            (BLOCK_BYTE / sizeof(Q_T)) * (runInfo.mRealSize - runInfo.halfMRealSize)],
+        // 1:2 -> the second AIV of the pair fills the upper half of the P tile.
+        // 1:1 -> each replayed pass fills exactly the slot its paired AIV would
+        //        have owned, so the cube-side P layout is unchanged.
+        const int32_t pTileOffset = (AIV_PER_AIC == 2) ?
+            static_cast<int32_t>(constInfo.subBlockIdx) * (BLOCK_BYTE / sizeof(Q_T)) *
+                (runInfo.mRealSize - runInfo.halfMRealSize) :
+            static_cast<int32_t>(BLOCK_BYTE / sizeof(Q_T)) * runInfo.firstHalfMRealSize;
+        DataCopy(mm2AL1Tensor[pTileOffset],
             stage1CastTensor, {s2BaseSize / 16, (uint16_t)runInfo.halfMRealSize,
             (uint16_t)(vec1Srcstride - runInfo.halfMRealSize),
-            (uint16_t)(Align16Func(runInfo.mRealSize) - runInfo.halfMRealSize)});
+            (uint16_t)(Align16Func(runInfo.fullMRealSize) - runInfo.halfMRealSize)});
     }
 
     this->stage1OutQue[stage1Offset].template FreeTensor(stage1CastTensor);
@@ -630,7 +642,7 @@ void SFAVectorService<TEMPLATE_ARGS>::InitOutputSingleCore(ConstInfo &constInfo)
     }
 
     if (coreNum != 0) {
-        uint64_t singleCoreSize = (totalOutputSize + (CV_RATIO * coreNum) - 1) / (CV_RATIO * coreNum);
+        uint64_t singleCoreSize = (totalOutputSize + (AIV_PER_AIC * coreNum) - 1) / (AIV_PER_AIC * coreNum);
         uint64_t tailSize = totalOutputSize - constInfo.aivIdx * singleCoreSize;
         uint64_t singleInitOutputSize = tailSize < singleCoreSize ? tailSize : singleCoreSize;
         if (constInfo.aivIdx * singleCoreSize < totalOutputSize && singleInitOutputSize > 0) {
@@ -647,7 +659,8 @@ void SFAVectorService<TEMPLATE_ARGS>::InitOutputSingleCore(ConstInfo &constInfo)
             totalReturnSoftmaxSize = constInfo.n2Size * constInfo.s1Size * constInfo.gSize; // (N2,T1,G)
         }
         if (coreNum != 0 && totalReturnSoftmaxSize > 0) {
-            uint64_t singleCoreSoftmaxSize = (totalReturnSoftmaxSize + (CV_RATIO * coreNum) - 1) / (CV_RATIO * coreNum);
+            uint64_t singleCoreSoftmaxSize = (totalReturnSoftmaxSize + (AIV_PER_AIC * coreNum) - 1) /
+                (AIV_PER_AIC * coreNum);
             uint64_t tailSoftmaxSize = totalReturnSoftmaxSize - constInfo.aivIdx * singleCoreSoftmaxSize;
             uint64_t singleInitSoftmaxSize = tailSoftmaxSize < singleCoreSoftmaxSize ?
                                              tailSoftmaxSize : singleCoreSoftmaxSize;
@@ -677,7 +690,7 @@ void SFAVectorService<TEMPLATE_ARGS>::ClearOutputTail(ConstInfo &constInfo)
     const uint64_t rowSize = static_cast<uint64_t>(constInfo.gSize) * static_cast<uint64_t>(constInfo.dSizeV);
     const uint64_t totalTailSize = (static_cast<uint64_t>(constInfo.s1Size) - actualRows) * rowSize;
     constexpr uint64_t alignElements = BUFFER_SIZE_BYTE_32B / sizeof(OUTPUT_T);
-    const uint64_t coreCount = static_cast<uint64_t>(CV_RATIO) * static_cast<uint64_t>(GetBlockNum());
+    const uint64_t coreCount = static_cast<uint64_t>(AIV_PER_AIC) * static_cast<uint64_t>(GetBlockNum());
     uint64_t singleCoreSize = (totalTailSize + coreCount - 1) / coreCount;
     // Keep adjacent AIV partitions on separate 32-byte GM blocks.
     singleCoreSize = (singleCoreSize + alignElements - 1) / alignElements * alignElements;
@@ -888,7 +901,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
     }
 
     if ASCEND_IS_AIV {
-        if (subBlockIdx == 0) {
+        // 1:2 -> only AIV0 of the pair publishes the shared params.
+        // 1:1 -> the single AIV is always the publisher.
+        if (AIV_PER_AIC == 1 || subBlockIdx == 0) {
             auto tempTilingSSbuf = reinterpret_cast<__ssbuf__ uint32_t*>(0); // 从ssbuf的0地址开始拷贝
             auto tempTiling = reinterpret_cast<uint32_t *>(&sharedParams);
 #pragma unroll

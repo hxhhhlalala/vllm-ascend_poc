@@ -431,7 +431,8 @@ void SFAMlaTiling::CalcFDWorkSpace(const uint32_t actCoreNum)
 void SFAMlaTiling::GetWorkspaceSize()
 {
     uint32_t actCoreNum = coreNum_;
-    if (sfaInfo_->isA5) {
+    // A6 runs the arch35 kernel, so it needs the arch35 workspace layout.
+    if (sfaInfo_->isA5 || sfaInfo_->isA6) {
         workspaceSize_ = libapiSize_;
         constexpr uint32_t TRIPLE_BUFFER_NUM = 3;
         constexpr uint32_t S2_BASE_SIZE = 128;            // S2轴基本块大小
@@ -483,7 +484,9 @@ void SFAMlaTiling::CalcBlockDim()
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(sfaInfo_->platformInfo);
     auto aicNum = usedCoreNum_;
-    auto aivNum = 2 * usedCoreNum_;
+    // A6 pairs one AIV with one AIC; asking for 2 * usedCoreNum AIVs makes the
+    // runtime launch only half of them and the AICs wait forever.
+    auto aivNum = (sfaInfo_->isA6 ? 1U : 2U) * usedCoreNum_;
 
     blockDim_ = ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum);
     OP_LOGI(sfaInfo_->opName, "SFA block dim: %u aiv Num: %u aic Num: %u.", blockDim_, aivNum, aicNum);
@@ -1381,7 +1384,7 @@ ge::graphStatus SFATilingCheck::CheckFeatureMlaNoQuantShape() const
             return ge::GRAPH_FAILED);
     } else {
         OP_CHECK_IF(ropeHeadDim_ != 0 && ropeHeadDim_ != 64,
-            OP_LOGE(opName_, "rope_head_dim should be 0 or 64 for A2/A3, but got %u", ropeHeadDim_),
+            OP_LOGE(opName_, "rope_head_dim should be 0 or 64 for A2/A3/A6, but got %u", ropeHeadDim_),
             return ge::GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
@@ -1459,6 +1462,7 @@ void SFATilingCheck::Init()
     opParamInfo_ = sfaInfo_.opParamInfo;
     npuArch_ = sfaInfo_.npuArch;
     isA5_ = sfaInfo_.isA5;
+    isA6_ = sfaInfo_.isA6;
 
     bSize_ = sfaInfo_.bSize;
     n1Size_ = sfaInfo_.n1Size;
@@ -1647,8 +1651,10 @@ ge::graphStatus SFAInfoParser::GetNpuInfo()
 
     npuArch_ = ascendcPlatform.GetCurNpuArch();
     isA5_ = (npuArch_ == NpuArch::DAV_3510);
-    // A6-ASC-FUSION: A6 is NpuArch::DAV_9201, original whitelist only had 2201/3510.
-    if (npuArch_ != NpuArch::DAV_2201 && npuArch_ != NpuArch::DAV_3510 && npuArch_ != NpuArch::DAV_9201) {
+    // A6-ASC-FUSION: A6 is NpuArch::DAV_9201 (DT) / DAV_9202 (PR).
+    isA6_ = (npuArch_ == NpuArch::DAV_9201 || npuArch_ == NpuArch::DAV_9202);
+    if (npuArch_ != NpuArch::DAV_2201 && npuArch_ != NpuArch::DAV_3510 &&
+        npuArch_ != NpuArch::DAV_9201 && npuArch_ != NpuArch::DAV_9202) {
         OPS_REPORT_VECTOR_INNER_ERR(opName_, "Npu Arch Version[%d] is not support.", static_cast<int32_t>(npuArch_));
         return GRAPH_FAILED;
     }
@@ -2005,6 +2011,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.opParamInfo = opParamInfo_;
     sfaInfo.npuArch = npuArch_;
     sfaInfo.isA5 = isA5_;
+    sfaInfo.isA6 = isA6_;
 
     sfaInfo.bSize = bSize_;
     sfaInfo.n1Size = n1Size_;

@@ -15,7 +15,12 @@
 
 #include "kernel_operator.h"
 #include "sparse_flash_attention_template_tiling_key.h"
-#if (__CCE_AICORE__ == 310)
+
+// A6 (ascend960dt/pr) shares the regbase arch35 kernel family even when the
+// compiler does not advertise __CCE_AICORE__ == 310 for it (same rule the
+// GDN FwdH kernel uses).
+#if (__CCE_AICORE__ == 310) || (defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202)))
+#define SFA_ARCH35 1
 #include "arch35/sparse_flash_attention_kernel_mla.h"
 #else
 #include "arch22/sparse_flash_attention_kernel_mla.h"
@@ -23,7 +28,7 @@
 
 using namespace AscendC;
 
-#if (__CCE_AICORE__ == 310)
+#if defined(SFA_ARCH35)
 #if defined(__DAV_C310_CUBE__)
 #define SFA_OP_IMPL(templateClass, tilingdataClass, NO_ROPE, ...)                                 \
     do {                                                                                          \
@@ -74,12 +79,18 @@ sparse_flash_attention(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_
                        __gm__ uint8_t *attentionOut, __gm__ uint8_t* softmaxMax, __gm__ uint8_t* softmaxSum,
                        __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))
+    // A6 (ascend960dt/pr) exposes 64 AIC and 64 AIV. A 1:2 request makes every
+    // AIC wait forever for a second AIV that is never scheduled.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+#else
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#endif
 
     TPipe tPipe;
     __gm__ uint8_t *user = GetUserWorkspace(workspace);
 
-#if (__CCE_AICORE__ == 310)
+#if defined(SFA_ARCH35)
     // NoPE (rope_head_dim=0) keeps a 512-wide K dimension; RoPE keeps 576.
     // Select at runtime from the tiling so a single tiling key still serves both.
     GET_TILING_DATA_WITH_STRUCT(SparseFlashAttentionTilingDataMla, dispatchTiling, tiling);

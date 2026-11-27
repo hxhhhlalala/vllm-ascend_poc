@@ -292,7 +292,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>:
     fixpipeParams.srcStride = Align16Func(fixpipeParams.mSize);
     // mmResUb上两行之间的间隔，单位：element。 // 128:根据比对dump文件得到, ND方案(S1*S2)时脏数据用mask剔除
     fixpipeParams.dstStride = s2BaseSize;
-    fixpipeParams.dualDstCtl = 1; // 双目标模式，按M维度拆分，M / 2 * N写入每个UB, M必须为2的倍数
+    // 双目标模式：AIC一次Fixpipe把M/2行分别写入两个AIV的UB（1:2）。
+    // A6 1:1只有本核一个AIV，必须整块写入本核UB。
+    fixpipeParams.dualDstCtl = (AIV_PER_AIC == 2) ? 1 : 0;
     fixpipeParams.params.ndNum = 1;
     fixpipeParams.params.srcNdStride = 0;
     fixpipeParams.params.dstNdStride = 0;
@@ -320,8 +322,13 @@ __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::IterateBmm2SFA(
                      0,    // isLeftTranspose
                      0     // isRightTranspose
                      };
+    // 左矩阵P 来自rope位置。1:2 时AIC一次读整块；1:1 的每一趟只读本趟
+    // 在P tile中的槽位（与原先配对AIV写入的位置一致）。
+    const uint64_t pTileBase = static_cast<uint64_t>(s2BaseSize) * static_cast<uint64_t>(constInfo.dSizeNope) +
+        ((AIV_PER_AIC == 1) ?
+            static_cast<uint64_t>(BLOCK_BYTE / sizeof(Q_T)) * static_cast<uint64_t>(runInfo.firstHalfMRealSize) : 0U);
     MatmulN<Q_T, Q_T, T, s1BaseSize, s2BaseSize, dBaseMatmulSize, ABLayout::MK, ABLayout::KN>(
-        inputRightBuf.GetTensor<Q_T>(s2BaseSize * constInfo.dSizeNope), // 左矩阵P 来自rope位置
+        inputRightBuf.GetTensor<Q_T>(pTileBase), // 左矩阵P 来自rope位置
         inputRightBuf.GetTensor<Q_T>(), // 右矩阵V nope
         mmL0ABuffers,
         mmL0BBuffers,
@@ -339,7 +346,7 @@ __aicore__ inline void SFAMatmulService<TEMPLATE_ARGS>::IterateBmm2SFA(
     fixpipeParams.mSize = Align2Func(runInfo.mRealSize);        // 有效数据不足16行，只需要输出部分行即可; L0C上的bmm1结果矩阵M方向的size大小;
     fixpipeParams.srcStride = Align16Func(fixpipeParams.mSize); // L0C上bmm1结果相邻连续数据片段间隔（前面一个数据块的头与后面数据块的头的间隔）
     fixpipeParams.dstStride = Align16Func(constInfo.dSizeNope);
-    fixpipeParams.dualDstCtl = 1;
+    fixpipeParams.dualDstCtl = (AIV_PER_AIC == 2) ? 1 : 0;
     fixpipeParams.params.ndNum = 1;
     fixpipeParams.params.srcNdStride = 0;
     fixpipeParams.params.dstNdStride = 0;

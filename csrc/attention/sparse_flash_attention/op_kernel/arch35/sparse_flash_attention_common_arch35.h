@@ -27,7 +27,26 @@ constexpr uint32_t BUFFER_SIZE_16K = 16384; // 16384表示16 * 1024
 constexpr uint32_t BUFFER_SIZE_32K = 32768; // 32768表示32 * 1024
 constexpr uint32_t BUFFER_SIZE_128K = 131072; // 131072表示128 * 1024
 
+// CV_RATIO is the *pipeline* row split: the vector stages are budgeted for
+// s1BaseSize / CV_RATIO rows (32 of 64) so that mm1/mm2/stage2 fit in UB. It
+// stays 2 on every target, including A6 (see AIV_PER_AIC below).
 constexpr uint32_t CV_RATIO = 2;
+
+// Number of AIV blocks the runtime pairs with one AIC block.
+//   2 -> ascend950 family (KERNEL_TYPE_MIX_AIC_1_2)
+//   1 -> A6 / ascend960dt / ascend960pr (KERNEL_TYPE_MIX_AIC_1_1, 64 AIC : 64 AIV)
+// The 1:2 pipeline is preserved on A6 by running the vector work of both
+// former AIVs sequentially inside the single AIV (see ConstInfo::mPasses).
+// This constant also drives the cross-core flag protocol in
+// common/op_kernel/buffer.h, which hard-codes the two-AIV flag ids.
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))
+constexpr uint32_t AIV_PER_AIC = 1;
+#define FA_AIV_PER_AIC 1
+#else
+constexpr uint32_t AIV_PER_AIC = 2;
+#define FA_AIV_PER_AIC 2
+#endif
+
 constexpr uint64_t SYNC_MODE = 4;
 
 static constexpr uint32_t SFA_SYNC_MODE0 = 0;

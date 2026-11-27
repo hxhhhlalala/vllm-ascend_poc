@@ -77,7 +77,8 @@ private:
                                       int64_t s2LoopLimit, int64_t multiCoreInnerIdx);
     __aicore__ inline void ComputeBmm1Tail(RunInfo &runInfo, RunParamStr &runParam);
     __aicore__ inline void InitUniqueConstInfo();
-    __aicore__ inline void ComputeAxisIdxByBnAndGs1(int64_t bnIndex, int64_t gS1Index, RunParamStr &runParam);
+    __aicore__ inline void ComputeAxisIdxByBnAndGs1(int64_t bnIndex, int64_t gS1Index, int32_t mHalf,
+                                                    RunParamStr &runParam);
     __aicore__ inline void InitUniqueRunInfo(const RunParamStr &runParam, RunInfo &runInfo);
 
     __aicore__ inline void InitCalcParamsEach();
@@ -139,13 +140,21 @@ template <typename CubeBlockType, typename VecBlockType>
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
     fa_base_matmul::idCounterNum = 0;
-    constInfo.subBlockIdx = GetSubBlockIdx();
+    // A6 runs MIX_AIC_1_1: one AIV per AIC, so there is no "second half" AIV.
+    constInfo.subBlockIdx = (AIV_PER_AIC == 1) ? 0 : GetSubBlockIdx();
     if ASCEND_IS_AIC {
         this->aicIdx = GetBlockIdx();
         constInfo.aivIdx = 0;
     } else {
         constInfo.aivIdx = GetBlockIdx();
-        this->aicIdx = constInfo.aivIdx >> 1;
+        if constexpr (AIV_PER_AIC == 1) {
+            // Block i of the AIV launcher is paired with block i of the AIC
+            // launcher. The historical >>1 mapping would make AIV 2p and 2p+1
+            // both claim AIC p, leaving AIC p >= coreNum/2 with no partner.
+            this->aicIdx = static_cast<int32_t>(constInfo.aivIdx);
+        } else {
+            this->aicIdx = constInfo.aivIdx >> 1;
+        }
         this->tilingData = tiling;
     }
 
@@ -224,6 +233,10 @@ void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::InitCalcParamsE
 
     if constexpr (IS_SPLIT_G) {
         maxS2LoopCnt = avgBaseNum * (constInfo.sparseBlockCount + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
+        if constexpr (AIV_PER_AIC == 1) {
+            // Every M block is replayed mPasses times by the single AIV.
+            maxS2LoopCnt *= constInfo.mPasses;
+        }
     }
 
     if (aicIdx >= usedCoreNum) {
@@ -433,6 +446,16 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
     constInfo.oriWinLeft = sharedParams.oriWinLeft;
     constInfo.oriWinRight = sharedParams.oriWinRight;
     constInfo.sparseMode = sharedParams.oriMaskMode;
+    // One vector pass covers at most s1BaseSize / CV_RATIO M rows of the
+    // 1:2-sized pipeline (32 of 64). On A6 a single AIV owns the whole AIC,
+    // so an M block wider than that budget is covered by several passes.
+    {
+        uint32_t mBase = constInfo.gSize;
+        if constexpr (IS_SPLIT_G) {
+            mBase >>= 1;
+        }
+        constInfo.mPasses = (AIV_PER_AIC == 1 && mBase >= 2) ? 2U : 1U;
+    }
     constInfo.s1S2 = constInfo.s1Size * constInfo.s2Size;
     constInfo.gS1 = constInfo.gSize * constInfo.s1Size;
     constInfo.n2G = constInfo.n2Size * constInfo.gSize;
@@ -553,11 +576,19 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
             this->actualSeqQlenAddr, this->actualSeqKvlenAddr);
         ComputeS1LoopInfo<TEMPLATE_INTF_ARGS>(runParam, this->constInfo, lastBN, nextGs1Idx, gS1StartIdx);
 
-        int64_t gS1LoopEnd = lastBN ? (runParam.gs1LoopEndIdx + PRELOAD_NUM) : runParam.gs1LoopEndIdx;
-        for (int64_t gS1Index = runParam.gs1LoopStartIdx; gS1Index < gS1LoopEnd; gS1Index++) {
+        const int64_t mPasses = static_cast<int64_t>(this->constInfo.mPasses);
+        // Flatten (gS1, pass) into one pipeline duty cycle. On A6 mPasses is 2,
+        // so the single AIV replays the 1:2-sized vector pipeline once per half
+        // of the M block without changing any UB/L1 buffer size. PRELOAD_NUM
+        // drain iterations are appended in pipeline units, not M-block units.
+        int64_t gS1LoopEnd = lastBN ? (runParam.gs1LoopEndIdx * mPasses + PRELOAD_NUM)
+                                    : runParam.gs1LoopEndIdx * mPasses;
+        for (int64_t flatIdx = runParam.gs1LoopStartIdx * mPasses; flatIdx < gS1LoopEnd; flatIdx++) {
+            const int64_t gS1Index = flatIdx / mPasses;
+            const int32_t mHalf = static_cast<int32_t>(flatIdx % mPasses);
             bool notLastTwoLoop = true;
             if (lastBN) {
-                int32_t extraGS1 = gS1Index - runParam.gs1LoopEndIdx;
+                int32_t extraGS1 = static_cast<int32_t>(flatIdx - runParam.gs1LoopEndIdx * mPasses);
                 switch (extraGS1) {
                     case 0:
                         notLastTwoLoop = false;
@@ -571,9 +602,9 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
                 }
             }
             if (notLastTwoLoop) {
-                this->ComputeAxisIdxByBnAndGs1(bnIdx, gS1Index, runParam);
+                this->ComputeAxisIdxByBnAndGs1(bnIdx, gS1Index, mHalf, runParam);
                 bool s1NoNeedCalc = ComputeParamS1<TEMPLATE_INTF_ARGS>(
-                    runParam, this->constInfo, gS1Index, this->actualSeqQlenAddr);
+                    runParam, this->constInfo, gS1Index, mHalf, this->actualSeqQlenAddr);
                 // s1和s2有任意一个不需要算, 则continue, 如果是当前核最后一次循环，则补充计算taskIdx+2的部分
                 bool s2NoNeedCalc =
                     ComputeS2LoopInfo<TEMPLATE_INTF_ARGS>(runParam, this->constInfo);
@@ -667,7 +698,7 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
 
 template <typename CubeBlockType, typename VecBlockType>
 __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType>::ComputeAxisIdxByBnAndGs1(
-    int64_t bnIndex, int64_t gS1Index, RunParamStr &runParam)
+    int64_t bnIndex, int64_t gS1Index, int32_t mHalf, RunParamStr &runParam)
 {
     // GS1合轴, 不切G, 只切S1
     runParam.s1oIdx = gS1Index * runParam.qSNumInOneBlock;
@@ -675,6 +706,18 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
         runParam.goIdx = (aicIdx % 2 == 0) ? 0 : 64; // N1=128场景，相邻cube核处理一个s1，第一个cube核承担0-63行g，第二个cube核承担后64行g
     } else {
         runParam.goIdx = 0;
+    }
+    // A6 keeps a single AIV per AIC. When the M block of this core is wider
+    // than one pipeline pass, pass mHalf covers the next slice of the g axis.
+    if constexpr (AIV_PER_AIC == 1) {
+        if (this->constInfo.mPasses > 1) {
+            uint32_t mBase = this->constInfo.gSize;
+            if constexpr (IS_SPLIT_G) {
+                mBase >>= 1;
+            }
+            const uint32_t passRows = (mBase + this->constInfo.mPasses - 1) / this->constInfo.mPasses;
+            runParam.goIdx += static_cast<int64_t>(mHalf) * static_cast<int64_t>(passRows);
+        }
     }
 }
 
@@ -730,6 +773,7 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
     runInfo.mRealSize = runParam.mRealSize;
     runInfo.halfMRealSize = runParam.halfMRealSize;
     runInfo.firstHalfMRealSize = runParam.firstHalfMRealSize;
+    runInfo.fullMRealSize = runParam.fullMRealSize;
 
     runInfo.vec2S1BaseSize = runInfo.halfS1RealSize;
     runInfo.vec2MBaseSize = runInfo.halfMRealSize;

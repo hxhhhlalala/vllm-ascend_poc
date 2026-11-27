@@ -83,7 +83,11 @@ __aicore__ inline T AlignUp(T num, T rnd)
     return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd) * (rnd)));
 }
 
-#if ((__CCE_AICORE__ == 310) || (defined __DAV_310R6__) || (__NPU_ARCH__ == 5102))
+// Platforms with the 2D L1->L0 LoadData form. A6 (9201/9202) rejects the 3D
+// form with errcode 180 ("MTE instruction address is not aligned") on
+// LOAD_L1_TO_L0A_3DV2, so it must take this branch as well.
+#if ((__CCE_AICORE__ == 310) || (defined __DAV_310R6__) || (__NPU_ARCH__ == 5102) || \
+    (defined __NPU_ARCH__ && ((__NPU_ARCH__ == 9201) || (__NPU_ARCH__ == 9202))))
 template <typename T>
 __aicore__ inline uint32_t GetBlockNum(uint32_t size) {
     if constexpr (IsSameType<T, float>::value) {

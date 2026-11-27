@@ -40,6 +40,7 @@ constexpr int64_t MAX_PRE_NEXT_TOKENS = 0x7FFFFFFF;
     uint32_t mRealSize; \
     uint32_t halfMRealSize; \
     uint32_t firstHalfMRealSize; \
+    uint32_t fullMRealSize; \
     int64_t attentionOutOffset;    /* attentionOut的offset souter层确定 */ \
     int32_t actualS1Size;      /* Q的actualSeqLength */ \
     int32_t actualS2Size;    /* KV的actualSeqLength */ \
@@ -86,6 +87,7 @@ struct RunParamStr {  // 分核与切块需要使用到参数
     int32_t mRealSize; \
     int32_t halfMRealSize; \
     int32_t firstHalfMRealSize; \
+    int32_t fullMRealSize; \
     int32_t s2RealSize; /* s2方向基本块的真实长度 */ \
     int64_t s2AlignedSize; /* s2方向基本块对齐到16之后的长度 */ \
     int32_t vec2S1BaseSize; /* vector2侧开循环之后，经过切分的S1大小，例如把64切分成两份32 */ \
@@ -190,6 +192,11 @@ struct RunInfo {
     uint32_t aivIdx; \
     uint8_t layoutType; \
     uint8_t subBlockIdx;\
+    /* A6 1:1: number of vector passes the single AIV runs over one M block. */ \
+    /* 1 for the 1:2 pipeline (each of the two AIVs runs half the M rows).  */ \
+    /* 2 when one AIV has to cover an M block larger than the pipeline row   */ \
+    /* budget (s1BaseSize / CV_RATIO). */ \
+    uint32_t mPasses; \
     /* 分核相关 */ \
     uint32_t s2Start; \
     uint32_t s2End; \
